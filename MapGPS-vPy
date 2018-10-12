@@ -1,0 +1,155 @@
+# Extracts GPS coordinates from images in X-Ways Forensic software and creates a KML file plotting
+# the location data that can be opened in Google Earth.
+
+
+
+import XWF, sys
+from tempfile import TemporaryFile
+from PIL import Image # non-standard library, must be installed in Python path (PIL 1.1.7 http://www.pythonware.com/products/pil/ )
+from PIL.ExifTags import TAGS, GPSTAGS
+
+# This class provided by X-Ways OutputRedirector sample script; I included it in this script to prevent needing two files
+class redirector:
+   def write(self, text):
+      # flag=1: Python calls print a second time to print the line feed
+      # so we don't need to do this here
+      XWF.OutputMessage(text, 1)
+      return
+
+gps_data = {} # global dictionary for storing filenames and GPS coordinates
+
+# The first function that is called when a Python X-Tension is called
+def XT_Init(nVersion, nFlags, hMainWnd, lpReserved):
+    sys.stderr = sys.stdout = redirector() # instantiates redirector class object provided by X-Ways (so print statements output to messages window)
+    print('Initialized')
+    return 
+
+# Describes X-Tension, required function    
+def XT_About(hParentWnd, lpReserved):
+    print('Creates virtual KML file containing GPS data from images.')
+    return
+
+# Called before items or search hits are processed individually, required function
+def XT_Prepare(hVolume, hEvidence, nOpType, lpReserved):
+    return
+
+# Use for search X-Tensions (loaded from search dialog within X-Ways), required function
+def XT_ProcessSearchHit(iSize, nItemID, nRelOfs, nAbsOfs, lpOptionalHitPtr, lpSearchTermID, nLength, nCodePage, nFlags):
+    return
+
+# Implement and export this function if you merely need to retrieve information about the file but don't need to read its contents (performance benefit)
+def XT_ProcessItem(nItem, reserved):
+    return
+
+def get_exif_data(image):
+    exif_data = {}
+    try:
+        info = image._getexif()
+    except AttributeError:
+        info = None
+    if info:
+        for tag, value in info.items():
+            decoded = TAGS.get(tag, tag)
+            if decoded == "GPSInfo":
+                gps_data = {}
+                for gps_tag in value:
+                    sub_decoded = GPSTAGS.get(gps_tag, gps_tag)
+                    gps_data[sub_decoded] = value[gps_tag]
+
+                exif_data[decoded] = gps_data
+            else:
+                exif_data[decoded] = value
+
+    return exif_data
+	
+def _convert_to_degrees(value):
+    deg_num, deg_denom = value[0]
+    d = float(deg_num) / float(deg_denom)
+
+    min_num, min_denom = value[1]
+    m = float(min_num) / float(min_denom)
+
+    sec_num, sec_denom = value[1]
+    s = float(sec_num) / float(sec_denom)
+    
+    return d + (m / 60.0) + (s / 3600.0)
+
+def get_lat_lon(exif_data):
+    lat = None
+    lon = None
+
+    if "GPSInfo" in exif_data:		
+        gps_info = exif_data["GPSInfo"]
+
+        gps_latitude = gps_info.get("GPSLatitude")
+        gps_latitude_ref = gps_info.get('GPSLatitudeRef')
+        gps_longitude = gps_info.get('GPSLongitude')
+        gps_longitude_ref = gps_info.get('GPSLongitudeRef')
+
+        if gps_latitude and gps_latitude_ref and gps_longitude and gps_longitude_ref:
+            lat = _convert_to_degrees(gps_latitude)
+            if gps_latitude_ref != "N":                     
+                lat *= -1
+
+            lon = _convert_to_degrees(gps_longitude)
+            if gps_longitude_ref != "E":
+                lon *= -1
+
+    return lat, lon
+    
+def writeKML():
+    print('Specify the location and filename where you wish to save the GPS report file. WARNING: If you select an existing file, it will be overwritten without warning!')
+    try:
+        filename = XWF.GetSaveFileName() # shows save file dialog within X-Ways (I haven't figured out how to pass any parameters to this that it recognizes)
+    except SystemError:
+        print('You did not select a valid report path and file name.')
+        return
+    if filename[-4:] != '.kml':
+        filename += '.kml'
+    with open(filename, "w+") as kml:
+        kml.write('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n<name>Embedded GPS EXIF Data</name>')
+        for fn, (lat, lon) in gps_data.items():
+            kml.write('\n<Placemark>\n\t<name>%s</name>' % fn)
+            kml.write('\n\t<Point>\n\t\t<coordinates>%s,%s</coordinates>\n\t</Point>\n</Placemark>' % (lon, lat))
+        kml.write("\n</Document>\n</kml>")
+    print('KML report generated at %s. View report using Google Earth.' % filename)
+
+# Implement and export this function if you need to read the item's contents, which you can do using the hItem parameter (file handle)
+def XT_ProcessItemEx(nItem, hItem, reserved):
+    global gps_data
+    offset = 0
+    size = XWF.GetItemSize(nItem)
+    fn = str(nItem) + '__' + XWF.GetItemName(nItem)
+    if offset < size:
+        with TemporaryFile(prefix=fn) as tmpFile:
+            tmpFile.write(XWF.Read(hItem, offset, size))
+            tmpFile.seek(0)
+            try:
+                image = Image.open(tmpFile)
+                exif_data = get_exif_data(image)
+            except IOError:
+                print('%s is not an image' % fn)
+                return
+            gps = get_lat_lon(exif_data)
+            if gps[0]:
+                gps_data[fn] = (repr(gps[0]), repr(gps[1]))
+                print('Found GPS data in %s' % fn)
+            else:
+                print('No GPS data in image %s' % fn)
+            del image
+    else:
+        print('%s is too small to contain GPS data.' % fn)
+    return
+
+# Called when other operations have completed, required function
+def XT_Finalize(hVolume, hEvidence, nOpType, lpReserved):
+    if gps_data:
+        writeKML()
+    else:
+        print('No GPS data in any specified images.')
+    return
+
+# Called just before the DLL is unloaded to give you a chance to dispose any allocated memory, save certain data permanently etc., required function
+def XT_Done(lpReserved):
+    print('Finished processing files.')
+return
